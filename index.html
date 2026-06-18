@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ledger — ask your 10-K</title>
+<!--
+  LEDGER. Upload a 10-K PDF, ask a question in chat, and Ledger finds the answer,
+  scrolls to it, and DRAWS on the document — pointing at the exact words with a
+  hand-drawn animation — while it explains, by voice and text, why that's the answer.
+
+  Offline: ships with a sample 10-K + scripted answers, plus a keyword-locate fallback
+  that works on any uploaded PDF. Wire CONFIG.USE_LIVE_API to Claude for real reasoning
+  on any filing (see "CLAUDE API HOOKUP" in app.js). PDF rendering is vendored (pdf.js),
+  so it runs with no network.
+-->
+<style>
+  :root{
+    --ink:#c0392b;            /* the "pen" — annotation ink */
+    --ink-2:#0f766e;          /* secondary ink (arrows / brackets) */
+    --fg:#1c2530; --fg-soft:#5b6776; --line:#e6e8ec; --line-2:#d3d8df;
+    --bg:#eceef1; --panel:#fff; --accent:#c0392b;
+    --ui:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    --shadow:0 8px 30px rgba(20,28,38,.14);
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%;margin:0}
+  body{font-family:var(--ui);color:var(--fg);background:var(--bg);height:100vh;overflow:hidden;-webkit-font-smoothing:antialiased}
+
+  /* ---------------- upload view ---------------- */
+  #uploadView{height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:26px;
+    background:radial-gradient(1200px 600px at 50% -10%,#fff,transparent),var(--bg);padding:24px}
+  .logo{display:flex;align-items:center;gap:12px;font-size:24px;font-weight:700;letter-spacing:.2px}
+  .logo .mk{width:40px;height:40px;border-radius:12px;background:var(--accent);color:#fff;display:grid;place-items:center;font-size:22px;
+    box-shadow:0 4px 14px rgba(192,57,43,.4)}
+  .tagline{color:var(--fg-soft);font-size:16px;max-width:560px;text-align:center;line-height:1.55;margin-top:-12px}
+  .drop{width:min(620px,92vw);background:var(--panel);border:2px dashed var(--line-2);border-radius:20px;padding:46px 30px;
+    text-align:center;transition:.18s;cursor:pointer}
+  .drop:hover,.drop.over{border-color:var(--accent);background:#fff;box-shadow:var(--shadow);transform:translateY(-2px)}
+  .drop .ic{font-size:42px}
+  .drop h3{margin:14px 0 4px;font-size:19px}
+  .drop p{margin:0;color:var(--fg-soft);font-size:14px}
+  .drop .or{margin-top:18px;font-size:13px;color:var(--fg-soft)}
+  .linkbtn{background:none;border:0;color:var(--accent);font:inherit;font-size:13px;font-weight:600;cursor:pointer;text-decoration:underline}
+  .privacy{font-size:12px;color:var(--fg-soft)}
+
+  /* ---------------- app view ---------------- */
+  #appView{display:none;grid-template-rows:auto 1fr;height:100%}
+  #appView.on{display:grid}
+  .bar{display:flex;align-items:center;gap:12px;padding:10px 16px;background:var(--panel);border-bottom:1px solid var(--line);z-index:5}
+  .bar .mk{width:28px;height:28px;border-radius:8px;background:var(--accent);color:#fff;display:grid;place-items:center;font-size:16px}
+  .bar b{font-weight:700}
+  .bar .fname{color:var(--fg-soft);font-size:13px;border-left:1px solid var(--line);padding-left:12px;max-width:46vw;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .bar .sp{flex:1}
+  .bar button{font:inherit;font-size:12.5px;border:1px solid var(--line-2);background:#fff;border-radius:9px;padding:6px 11px;cursor:pointer;color:var(--fg)}
+  .bar button:hover{border-color:var(--accent);color:var(--accent)}
+  .bar button.on{background:var(--accent);border-color:var(--accent);color:#fff}
+
+  .stage{display:grid;grid-template-columns:minmax(0,1fr) 400px;min-height:0}
+
+  /* PDF viewer */
+  #viewer{overflow:auto;padding:26px 0 80px;scroll-behavior:smooth;background:var(--bg)}
+  .page{position:relative;margin:0 auto 22px;background:#fff;box-shadow:0 4px 18px rgba(20,28,38,.13);border-radius:3px}
+  .page canvas{display:block;border-radius:3px}
+  .page .anno{position:absolute;inset:0;pointer-events:none;overflow:visible}
+  .page .pnum{position:absolute;top:-20px;right:2px;font-size:11px;color:var(--fg-soft)}
+  .focus-band{position:absolute;left:0;right:0;background:rgba(192,57,43,.06);pointer-events:none;transition:opacity .4s}
+
+  /* annotation ink */
+  .anno path,.anno line,.anno polyline{fill:none;stroke:var(--ink);stroke-width:2.6;stroke-linecap:round;stroke-linejoin:round;
+    filter:drop-shadow(0 1px 1px rgba(192,57,43,.25))}
+  .anno .hl{fill:rgba(255,210,90,.34);stroke:none;filter:none}
+  .anno .arrow{stroke:var(--ink-2)} .anno .arrow.head{fill:var(--ink-2);stroke:none}
+  .anno .lbl{fill:var(--ink);font:600 13px var(--ui);filter:none}
+  .anno .lbl-bg{fill:#fff;stroke:var(--ink);stroke-width:1.4}
+
+  /* chat */
+  #chat{background:var(--panel);border-left:1px solid var(--line);display:flex;flex-direction:column;min-height:0}
+  .chat-head{display:flex;align-items:center;gap:10px;padding:13px 15px;border-bottom:1px solid var(--line)}
+  .chat-head .av{width:30px;height:30px;border-radius:50%;background:linear-gradient(145deg,#e05a45,#c0392b);color:#fff;display:grid;place-items:center;font-size:15px;
+    box-shadow:0 2px 8px rgba(192,57,43,.4)}
+  .chat-head .nm{font-weight:700;font-size:14px;line-height:1.1}
+  .chat-head .nm small{display:block;font-weight:500;color:var(--fg-soft);font-size:11px}
+  .chat-head .sp{flex:1}
+  .ibtn{border:1px solid var(--line);background:#fff;border-radius:8px;width:30px;height:30px;cursor:pointer;display:grid;place-items:center;color:var(--fg-soft)}
+  .ibtn:hover{border-color:var(--accent);color:var(--accent)} .ibtn.on{background:var(--accent);border-color:var(--accent);color:#fff}
+
+  .msgs{flex:1;overflow-y:auto;padding:16px 15px;display:flex;flex-direction:column;gap:12px}
+  .msg{max-width:90%;font-size:13.5px;line-height:1.55;border-radius:14px;padding:10px 13px;animation:pop .25s ease}
+  @keyframes pop{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+  .msg.user{align-self:flex-end;background:var(--accent);color:#fff;border-bottom-right-radius:5px}
+  .msg.bot{align-self:flex-start;background:#f3f5f7;color:var(--fg);border-bottom-left-radius:5px}
+  .msg.bot.pointing{box-shadow:0 0 0 2px var(--ink) inset}
+  .msg .cue{font-size:11px;color:var(--ink);font-weight:600;display:flex;align-items:center;gap:6px;margin-bottom:4px}
+  .speaking{display:inline-flex;gap:2px}.speaking i{width:3px;height:10px;background:var(--ink);border-radius:2px;animation:eq .9s infinite}
+  .speaking i:nth-child(2){animation-delay:.15s}.speaking i:nth-child(3){animation-delay:.3s}
+  @keyframes eq{0%,100%{transform:scaleY(.4)}50%{transform:scaleY(1)}}
+  .msg .cite{display:inline-block;margin-top:6px;font-size:11px;color:var(--accent);background:#fff;border:1px solid var(--line-2);border-radius:6px;padding:1px 7px;cursor:pointer}
+  .msg .cite:hover{background:var(--accent);color:#fff;border-color:var(--accent)}
+  .thinking{align-self:flex-start;color:var(--fg-soft);font-size:13px;display:flex;gap:5px;align-items:center;padding:4px 2px}
+  .dot{width:6px;height:6px;border-radius:50%;background:var(--fg-soft);animation:bounce 1.2s infinite}
+  .dot:nth-child(2){animation-delay:.15s}.dot:nth-child(3){animation-delay:.3s}
+  @keyframes bounce{0%,80%,100%{opacity:.3;transform:translateY(0)}40%{opacity:1;transform:translateY(-4px)}}
+
+  .suggest{padding:0 15px 8px;display:flex;flex-wrap:wrap;gap:6px}
+  .suggest button{border:1px solid var(--line-2);background:#fff;border-radius:18px;padding:6px 11px;font:inherit;font-size:12px;color:var(--fg-soft);cursor:pointer}
+  .suggest button:hover{border-color:var(--accent);color:var(--accent)}
+  .composer{border-top:1px solid var(--line);padding:11px 13px;display:flex;gap:8px}
+  .composer input{flex:1;font:inherit;font-size:13.5px;border:1px solid var(--line-2);border-radius:11px;padding:11px 13px}
+  .composer input:focus{outline:none;border-color:var(--accent)}
+  .composer button{border:0;background:var(--accent);color:#fff;border-radius:11px;padding:0 16px;font-weight:600;cursor:pointer}
+  .composer button:disabled{opacity:.5;cursor:default}
+
+  .loadwrap{position:absolute;inset:0;display:grid;place-items:center;background:var(--bg);z-index:6}
+  .loadwrap .box{text-align:center;color:var(--fg-soft)}
+  .spin{width:34px;height:34px;border:3px solid var(--line-2);border-top-color:var(--accent);border-radius:50%;animation:spin 1s linear infinite;margin:0 auto 12px}
+  @keyframes spin{to{transform:rotate(360deg)}}
+
+  /* key modal */
+  .modal{position:fixed;inset:0;background:rgba(20,28,38,.5);display:grid;place-items:center;z-index:60;padding:20px}
+  .modal[hidden]{display:none}
+  .sheet{background:#fff;border-radius:16px;box-shadow:var(--shadow);max-width:480px;width:100%;padding:22px 22px 18px}
+  .sheet h3{margin:0 0 8px;font-size:18px}
+  .sheet p{margin:0 0 12px;font-size:13.5px;line-height:1.55;color:var(--fg-soft)}
+  .sheet .kf{display:flex;align-items:center;gap:10px}
+  .sheet input[type=password],.sheet input[type=text]{flex:1;font:inherit;font-size:13.5px;border:1px solid var(--line-2);border-radius:10px;padding:10px 12px}
+  .sheet input:focus{outline:none;border-color:var(--accent)}
+  .chk{font-size:12.5px;color:var(--fg-soft);white-space:nowrap;display:flex;align-items:center;gap:4px}
+  .krow{display:flex;align-items:center;gap:8px;margin-top:14px}
+  .krow a{font-size:12.5px;color:var(--accent)}
+  .krow .sp{flex:1}
+  .krow button{font:inherit;font-size:13px;border-radius:10px;padding:8px 14px;cursor:pointer;border:1px solid var(--line-2);background:#fff}
+  .krow button.ghost{color:var(--fg-soft)}
+  .krow #keySave{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:600}
+  .sheet .warn{font-size:11.5px;color:var(--fg-soft);margin-top:14px;background:#fff7f6;border:1px solid #f3d6d2;border-radius:9px;padding:8px 10px}
+  #keyBtn.set{background:var(--accent);border-color:var(--accent);color:#fff}
+
+  @media (max-width:860px){
+    .stage{grid-template-columns:1fr;grid-template-rows:1fr 44vh}
+    #chat{border-left:0;border-top:1px solid var(--line)}
+  }
+</style>
+</head>
+<body>
+
+  <!-- UPLOAD -->
+  <div id="uploadView">
+    <div class="logo"><span class="mk">L</span>Ledger</div>
+    <p class="tagline">Upload a 10-K. Ask anything. I'll find the answer in the filing and <b>draw it for you</b> — pointing to the exact words while I explain why.</p>
+    <div class="drop" id="drop">
+      <div class="ic">📄</div>
+      <h3>Drop a 10-K PDF here</h3>
+      <p>or click to choose a file</p>
+      <div class="or">No filing handy? <button class="linkbtn" id="loadSample">Load a sample 10-K</button></div>
+    </div>
+    <p class="privacy">Your file stays in your browser — nothing is uploaded in this prototype.</p>
+    <input type="file" id="fileInput" accept="application/pdf" hidden>
+  </div>
+
+  <!-- APP -->
+  <div id="appView">
+    <div class="bar">
+      <span class="mk">L</span><b>Ledger</b>
+      <span class="fname" id="fname">—</span>
+      <span class="sp"></span>
+      <button id="keyBtn">🔑 Add your key</button>
+      <button class="ibtn on" id="muteBtn" title="Voice on/off">🔊</button>
+      <button id="newBtn">New PDF</button>
+    </div>
+    <div class="stage">
+      <div id="viewer">
+        <div class="loadwrap" id="loadwrap"><div class="box"><div class="spin"></div>Rendering filing…</div></div>
+      </div>
+      <aside id="chat">
+        <div class="chat-head">
+          <span class="av">◆</span>
+          <span class="nm">Ledger<small>reads only this filing</small></span>
+          <span class="sp"></span>
+        </div>
+        <div class="msgs" id="msgs"></div>
+        <div class="suggest" id="suggest"></div>
+        <div class="composer">
+          <input id="ask" placeholder="Ask about this 10-K…" aria-label="Ask Ledger" disabled>
+          <button id="send" disabled>Ask</button>
+        </div>
+      </aside>
+    </div>
+  </div>
+
+  <!-- bring-your-own-key modal -->
+  <div id="keyModal" class="modal" hidden>
+    <div class="sheet">
+      <h3>Use your own Claude key</h3>
+      <p>Paste your Anthropic API key to get full answers on any question and any PDF. It's saved
+        <b>only in this browser</b> and sent <b>only to Anthropic</b> when you ask — never to us, and
+        it is <b>not part of this app's files</b>. Anyone you share the app with adds their own key.</p>
+      <div class="kf">
+        <input id="keyInput" type="password" placeholder="sk-ant-..." autocomplete="off" spellcheck="false">
+        <label class="chk"><input type="checkbox" id="keyShow"> show</label>
+      </div>
+      <div class="krow">
+        <a href="https://console.anthropic.com/settings/keys" target="_blank" rel="noopener">Get a key ↗</a>
+        <span class="sp"></span>
+        <button id="keyClear" class="ghost">Remove</button>
+        <button id="keyCancel" class="ghost">Cancel</button>
+        <button id="keySave">Save</button>
+      </div>
+      <p class="warn">A key typed into a web page is visible to that page — only ever paste your <i>own</i>
+        key, and never save a key into a file you share.</p>
+    </div>
+  </div>
+
+  <script src="vendor/pdf.min.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

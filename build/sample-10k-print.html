@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8">
+<title>Helios Materials 10-K</title>
+<style>
+  @page { size: letter; margin: 0.9in 0.9in; }
+  *{box-sizing:border-box}
+  body{font-family:"Times New Roman",Georgia,serif;color:#111;font-size:11.5pt;line-height:1.5;margin:0}
+  .sec{page-break-before:always}
+  .sec:first-of-type{page-break-before:avoid}
+  .tag{font-size:9pt;letter-spacing:1px;text-transform:uppercase;color:#444;font-weight:bold}
+  h2{font-size:17pt;margin:2pt 0 10pt}
+  h3{font-size:11.5pt;margin:14pt 0 4pt}
+  p{margin:0 0 8pt}
+  .c{text-align:center}.i{font-style:italic;color:#333}
+  table{width:100%;border-collapse:collapse;font-size:9.5pt;margin:6pt 0 12pt}
+  th{text-align:right;border-bottom:1.2pt solid #333;padding:4pt 7pt;font-size:8.5pt;text-transform:uppercase}
+  th:first-child{text-align:left}
+  td{padding:3pt 7pt;text-align:right;border-bottom:.5pt solid #ccc}
+  td:first-child{text-align:left}
+  tr.subtotal td{font-weight:bold;border-top:.8pt solid #333}
+  tr.total td{font-weight:bold;border-top:1.2pt solid #333;border-bottom:1.2pt solid #333}
+  tr.hdr td{font-weight:bold;text-align:left;background:#f0f0f0}
+  .flag{}
+</style></head>
+<body><div id="root"></div>
+<script src="../sample-10k.js"></script>
+<script>
+  var d = window.SAMPLE_10K;
+  document.title = d.company + " " + d.form;
+  document.getElementById("root").innerHTML = d.sections.map(function(s){
+    var html = s.html
+      .replace(/class="doc-center"/g,'class="c"')
+      .replace(/class="doc-italic"/g,'class="i"')
+      .replace(/class="doc-flag"/g,'class="flag"')
+      .replace(/&nbsp;/g,' ');
+    return '<div class="sec"><div class="tag">'+s.item+'</div><h2>'+s.title+'</h2>'+html+'</div>';
+  }).join("");
+</script></body></html>

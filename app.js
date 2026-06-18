@@ -39,7 +39,10 @@ RULES: copy every "find" verbatim from the provided text (it is used to locate t
 the page — if it isn't an exact substring it won't be found); never invent numbers; ground
 every claim in the filing; if the answer isn't in the filing, return an empty steps array and
 a "note" saying so. Lead the user from where the figure lives to why it's the right one. Keep
-"say" plain-spoken; expand acronyms once.`;
+"say" plain-spoken; expand acronyms once. If the user asks to SEE a statement or section
+(e.g. "income statement", "balance sheet", "cash flows"), point FIRST to that statement's
+heading on the page that holds the actual figures — never a table-of-contents entry — then to
+the one or two key lines they'd want (e.g. total revenue, net income), explaining each.`;
 
 const S = { pdf: null, pages: [], fullText: "", voice: true, isSample: false, busy: false };
 
@@ -236,7 +239,7 @@ async function ask(question) {
 
   for (let i = 0; i < res.steps.length; i++) {
     const st = res.steps[i];
-    const loc = st.find ? locate(st.find) : null;
+    const loc = st._loc || (st.find ? locate(st.find) : null);
     if (loc) { scrollToBox(loc.page, loc.bbox); await wait(520); annotate(loc.page, loc.bbox, st.type || "circle"); await wait(180); }
     const bubble = addBot(st.say, loc);
     await speakAndWait(st.say);
@@ -252,7 +255,7 @@ function setComposer(on) { $("#ask").disabled = !on; $("#send").disabled = !on; 
 async function brain(q) {
   if (getUserKey()) return liveBrain(q);                       // user supplied their own key → real reasoning
   if (S.isSample) { const s = scriptFor(q); if (s) return s; } // offline: curated answers on the sample
-  return keywordBrain(q);                                      // offline: locate-by-keyword on any PDF
+  return offlineNav(q);                                        // offline: honest section navigation, no faking
 }
 
 const STEPS_SCHEMA = {
@@ -352,19 +355,52 @@ const SCRIPTS = [
 ];
 function scriptFor(q) { const s = q.toLowerCase(); for (const r of SCRIPTS) if (r.re.test(s)) return { steps: r.steps }; return null; }
 
-/* ---- offline fallback for ANY uploaded PDF: locate the strongest keyword and point ---- */
-const STOP = new Set("the a an of to in is are was were be on for and or how do i what where which when find show me this that my your our with as at it its by from can you should would could need want help me about".split(" "));
-function keywordBrain(q) {
-  const words = q.toLowerCase().replace(/[^a-z0-9%$. ]/g, " ").split(/\s+/).filter((w) => w.length > 2 && !STOP.has(w));
-  const tries = [];
-  if (words.length >= 2) tries.push(words.slice(0, 3).join(" "), words.slice(0, 2).join(" "));
-  words.sort((a, b) => b.length - a.length).forEach((w) => tries.push(w));
-  for (const t of tries) {
-    const loc = locate(t);
-    if (loc) return { steps: [{ find: t, type: "circle",
-      say: `Here's where this filing talks about “${t}.” I've pointed to it — read the surrounding sentence to confirm it's what you need. Tap 🔑 to add your Claude key for a full, reasoned walkthrough of why this is the right answer.` }] };
+/* ---- offline (no key): jump to standard 10-K sections by their real heading, honestly. ----
+   No reasoning is possible without the model, so we navigate to known sections and say so —
+   we never circle a random keyword and pretend it's the answer. */
+const SECTIONS = [
+  { re: /income statement|statement of operations|p&l|profit and loss|net income|revenue|sales|earnings|operating income/,
+    terms: ["consolidated statements of operations", "consolidated statement of operations", "statements of operations", "statement of operations", "consolidated statements of income", "statements of income", "income statement"],
+    numbersPage: true, label: "income statement (statements of operations)" },
+  { re: /balance sheet|total assets|liabilit|financial position/,
+    terms: ["consolidated balance sheets", "consolidated balance sheet", "balance sheets", "balance sheet", "statements of financial position"],
+    numbersPage: true, label: "balance sheet" },
+  { re: /cash ?flow/,
+    terms: ["consolidated statements of cash flows", "statements of cash flows", "statement of cash flows", "cash flows"],
+    numbersPage: true, label: "statement of cash flows" },
+  { re: /equity|stockholder|shareholder/,
+    terms: ["statements of shareholders' equity", "statements of stockholders' equity", "shareholders' equity", "stockholders' equity", "changes in equity"],
+    numbersPage: true, label: "statement of equity" },
+  { re: /md&a|management.s discussion|liquidity|results of operation/,
+    terms: ["management's discussion and analysis", "management’s discussion and analysis", "results of operations"], label: "MD&A" },
+  { re: /risk factor/, terms: ["risk factors"], label: "risk factors" },
+  { re: /debt|leverage|borrow|notes payable|credit facility|maturit/,
+    terms: ["long-term debt", "credit facility", "notes payable", "indebtedness", "aggregate maturities"], numbersPage: true, label: "debt" },
+  { re: /segment/, terms: ["segment information", "reportable segment", "operating segment", "segment"], numbersPage: true, label: "segment information" },
+];
+// pages with the most digits are the actual financial statements (not the table of contents)
+function digitCount(pg) { let d = 0; for (const it of pg.items) { const m = it.str.match(/\d/g); if (m) d += m.length; } return d; }
+function locateSection(terms, preferNumbers) {
+  let best = null, bestScore = -1;
+  for (const pg of S.pages) {
+    let bbox = null;
+    for (const t of terms) { bbox = findInItems(pg.items, norm(t)); if (bbox) break; }
+    if (!bbox) continue;
+    const score = preferNumbers ? digitCount(pg) : (S.pages.length - pg.n); // numbers → real statement; else earliest
+    if (score > bestScore) { bestScore = score; best = { page: pg, bbox }; }
+    if (!preferNumbers) break;   // first occurrence is fine for narrative sections
   }
-  return { note: `I searched the filing but couldn't find that offline. Tap 🔑 (top right) to add your own Claude key for real reasoning over any PDF — or load the sample 10-K and try “how fast is revenue growing?”.` };
+  return best;
+}
+function offlineNav(q) {
+  const s = q.toLowerCase();
+  for (const sec of SECTIONS) {
+    if (!sec.re.test(s)) continue;
+    const loc = locateSection(sec.terms, sec.numbersPage);
+    if (loc) return { steps: [{ find: null, _loc: loc, type: "circle",
+      say: `Here's the ${sec.label} in your filing — I've jumped to it and circled the heading on the page with the actual figures. I can't read the numbers off it or explain why they matter without reading the document, though: tap 🔑 to add your Claude key (it stays in your browser) and I'll walk you through it properly.` }] };
+  }
+  return { note: `I can only jump to standard sections offline — I can't actually read this filing without the model. To answer “${q}” properly (find it, point to the exact figures, and explain why), tap 🔑 (top right) and add your own Claude key. It stays in your browser and never touches a server.` };
 }
 
 /* ============================== wiring / boot ============================== */
@@ -376,7 +412,7 @@ const SUGGESTIONS = [
 ];
 function enableChat() {
   $("#suggest").innerHTML = "";
-  (S.isSample ? SUGGESTIONS : ["What's the revenue?", "Find the total debt", "Where is net income?"]).forEach((s) => {
+  (S.isSample ? SUGGESTIONS : (getUserKey() ? SUGGESTIONS : ["Show the income statement", "Show the balance sheet", "Show the cash flows"])).forEach((s) => {
     const b = el("button", null, esc(s)); b.onclick = () => { $("#ask").value = s; submit(); }; $("#suggest").appendChild(b);
   });
   setComposer(true);
@@ -388,7 +424,7 @@ function enableChat() {
       : "I've read this 10-K. Ask me anything — I'll find the answer, draw on the page, and explain why. (These sample questions work offline; tap 🔑 to add your Claude key and ask anything.)")
     : (live
       ? "I've loaded your filing (using your key). Ask anything and I'll point to the answer on the page and explain it."
-      : "I've loaded your filing. Offline I can point to keywords on the page — tap 🔑 (top right) to add your own Claude key for full reasoning on this PDF."));
+      : "I've loaded your filing. To actually read it — find an answer, point to the exact numbers, and explain why — I need the AI: tap 🔑 (top right) to add your own Claude key (it stays in your browser). Without it I can only jump you to standard sections like the income statement or balance sheet."));
 }
 function submit() { const v = $("#ask").value.trim(); if (!v) return; $("#ask").value = ""; ask(v); }
 

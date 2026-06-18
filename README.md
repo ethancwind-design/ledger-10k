@@ -1,5 +1,7 @@
 # Ledger — ask your 10-K, watch it get drawn for you
 
+**▶ Live demo: https://ethancwind-design.github.io/ledger-10k/** — open it, click **🔑** to add your own Claude key, and ask away.
+
 Upload a 10-K PDF. Ask a question in chat. Ledger finds the answer **in the filing**,
 scrolls to it, and **draws on the document** — a hand-drawn circle / underline / arrow
 pointing at the exact words — while it explains, by voice and text, **why** that's the

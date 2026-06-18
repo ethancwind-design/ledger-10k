@@ -30,21 +30,43 @@ function setUserKey(k) { try { localStorage.setItem("ledger.key", k); } catch (e
 function clearUserKey() { try { localStorage.removeItem("ledger.key"); } catch (e) {} }
 
 const SYSTEM_PROMPT =
-`You are Ledger, an AI that answers questions about ONE SEC 10-K by pointing at the exact
-words in the filing and explaining WHY they answer the question — like a tutor drawing on
-the page. Given the filing text and a question, return JSON: {"steps":[{"find": <verbatim
-substring copied EXACTLY from the filing to point at>, "type": "circle"|"underline"|"arrow",
-"say": <one or two spoken sentences explaining this step and why it matters>}], "note": <optional>}.
-RULES: copy every "find" verbatim from the provided text (it is used to locate the words on
-the page — if it isn't an exact substring it won't be found); never invent numbers; ground
-every claim in the filing; if the answer isn't in the filing, return an empty steps array and
-a "note" saying so. Lead the user from where the figure lives to why it's the right one. Keep
-"say" plain-spoken; expand acronyms once. If the user asks to SEE a statement or section
-(e.g. "income statement", "balance sheet", "cash flows"), point FIRST to that statement's
-heading on the page that holds the actual figures — never a table-of-contents entry — then to
-the one or two key lines they'd want (e.g. total revenue, net income), explaining each.`;
+`You are Ledger, a 10-K research assistant for analysts building financial models. You answer by
+POINTING at the exact words in THIS filing and explaining why — never by guessing or inventing
+numbers. When a request is broad or could mean several things, you FIRST ask a short numbered
+clarifying question, and you keep narrowing across rounds until you can point precisely.
 
-const S = { pdf: null, pages: [], fullText: "", voice: true, isSample: false, busy: false };
+Every reply is EXACTLY ONE JSON object — no prose, no markdown fences. It always contains all of
+these fields: "type", "question", "options", "steps", "note". Two shapes:
+
+1) CLARIFY — when you cannot yet point to ONE precise location:
+   {"type":"clarify","question":"<one short question>","options":["<label>","<label>", ...],"steps":[],"note":""}
+   - 2 to 5 plain-text option labels. No numbers/bullets/punctuation prefixes (the app numbers them).
+   - Options mutually distinct, collectively covering the likely intents, most-likely first.
+
+2) ANSWER — when you can point precisely:
+   {"type":"answer","question":"","options":[],"steps":[{"find":"<verbatim substring copied EXACTLY from the filing>","gesture":"circle"|"underline"|"arrow","say":"<one or two sentences: what it is and why it matters to the model>"}],"note":""}
+   - 1 to 4 steps. "find" MUST be an exact substring of the filing text (it locates the words on the
+     page; if it isn't exact it won't be found). Copy it verbatim. Never invent figures — point to WHERE
+     the number lives.
+
+DECISION RULE — clarify vs answer:
+- Specific ask (one line item / one footnote) → ANSWER directly. e.g. "diluted weighted-average share
+  count", "DSO / receivables days", "free cash flow", "remaining buyback authorization".
+- Broad ask (a whole statement, or 2+ possible targets) → CLARIFY. e.g. "income statement", "balance
+  sheet", "cash flow", "margins", "debt", "segments", "valuation".
+- KEEP CLARIFYING across rounds: the analyst's pick arrives as their next message; re-read the whole path
+  and either drill ONE level narrower (CLARIFY) or, once unambiguous, ANSWER. Each round must be strictly
+  narrower; never repeat a question or re-offer a chosen branch. If a pick is already a leaf, ANSWER now.
+- If the analyst gives qualifiers up front ("revenue by reportable segment, multi-year"), skip rounds you
+  can already resolve and ANSWER.
+- Routing: a standing BALANCE (gross debt, ROU asset, goodwill) is the balance sheet; the cash MOVEMENT of
+  an item (capex spend, buyback cash, debt proceeds) is the cash-flow statement; ASC 280 segment mechanics,
+  tax reconciliation, and MD&A drivers are cross-cutting.
+- If asked to SEE a statement, point FIRST to its heading on the page with the actual figures (never a
+  table-of-contents entry), then the key line(s).
+Stay strictly inside this filing's content and modeling relevance.`;
+
+const S = { pdf: null, pages: [], fullText: "", voice: true, isSample: false, busy: false, convo: [], activeOptions: null };
 
 const $ = (s) => document.querySelector(s);
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -227,60 +249,103 @@ function speakAndWait(text) {
 /* ============================= orchestration ============================= */
 async function ask(question) {
   if (S.busy || !question.trim()) return;
-  S.busy = true; setComposer(false);
+  if (!getUserKey()) { openKey(); return; }
+  S.busy = true; setComposer(false); clearOptions();
   addUser(question);
   clearAnnos();
+  S.convo = [userMsgWithFiling(question)];     // fresh reasoning thread for a typed question
+  await step();
+}
+async function step() {
   const thinking = addThinking();
   let res;
-  try { res = await brain(question); } catch (e) { res = { note: "Something went wrong reaching the model. " + (e.message || "") }; }
+  try { res = await liveStep(); } catch (e) { res = { note: "Something went wrong. " + (e.message || "") }; }
   thinking.remove();
-
-  if (!res.steps || !res.steps.length) { addPlain(res.note || "I couldn't find that in this filing."); S.busy = false; setComposer(true); return; }
-
-  for (let i = 0; i < res.steps.length; i++) {
-    const st = res.steps[i];
-    const loc = st._loc || (st.find ? locate(st.find) : null);
-    if (loc) { scrollToBox(loc.page, loc.bbox); await wait(520); annotate(loc.page, loc.bbox, st.type || "circle"); await wait(180); }
+  await handleResponse(res);
+}
+async function handleResponse(res) {
+  if (res && res.type === "clarify" && res.options && res.options.length) {
+    renderClarify(res.question, res.options, res.note);     // ask numbered question, wait for a pick
+    S.busy = false; setComposer(true); return;
+  }
+  if (res && res.type === "answer" && res.steps && res.steps.length) {
+    await runSteps(res.steps);
+    S.busy = false; setComposer(true); return;
+  }
+  addPlain((res && res.note) || "I couldn't find that in this filing — try rephrasing.");
+  S.busy = false; setComposer(true);
+}
+async function runSteps(steps) {
+  for (let i = 0; i < steps.length; i++) {
+    const st = steps[i];
+    const loc = st.find ? locate(st.find) : null;
+    if (loc) { scrollToBox(loc.page, loc.bbox); await wait(520); annotate(loc.page, loc.bbox, st.gesture || "circle"); await wait(180); }
     const bubble = addBot(st.say, loc);
     await speakAndWait(st.say);
     const sp = bubble.querySelector(".speaking"); if (sp) sp.remove();
     const cue = bubble.querySelector(".cue"); if (cue && !loc) cue.remove();
     await wait(loc ? 220 : 120);
   }
-  S.busy = false; setComposer(true);
+}
+/* numbered clarifying options — click or press 1-9 */
+function renderClarify(question, options, note) {
+  S.activeOptions = options.slice(0, 9);
+  const m = el("div", "msg bot clarify");
+  let html = `<div class="q">${esc(question)}</div>`;
+  if (note) html += `<div class="ow" style="margin:-4px 0 8px;color:var(--fg-soft)">${esc(note)}</div>`;
+  html += `<div class="opts">` + S.activeOptions.map((o, i) =>
+    `<button class="opt" data-i="${i}"><span class="n">${i + 1}</span><span>${esc(o)}</span></button>`).join("") + `</div>`;
+  html += `<div class="kbdhint">press 1–${S.activeOptions.length}, click, or type your own question</div>`;
+  m.innerHTML = html; msgs().appendChild(m); scrollMsgs();
+  S.activeContainer = m;
+  m.querySelectorAll(".opt").forEach((b) => { b.onclick = () => pick(+b.dataset.i); });
+  if (S.voice && "speechSynthesis" in window) { window.speechSynthesis.cancel(); const u = new SpeechSynthesisUtterance(question); u.rate = 1.04; window.speechSynthesis.speak(u); }
+}
+function clearOptions() { S.activeOptions = null; S.activeContainer = null; }
+function pick(i) {
+  if (S.busy || !S.activeOptions || i < 0 || i >= S.activeOptions.length) return;
+  const label = S.activeOptions[i], container = S.activeContainer;
+  if (container) container.querySelectorAll(".opt").forEach((b, j) => { b.disabled = true; if (j === i) b.classList.add("kbd"); });
+  clearOptions();
+  S.busy = true; setComposer(false);
+  addUser(label);
+  S.convo.push({ role: "user", content: label });          // continue the SAME thread → narrows further
+  step();
 }
 function setComposer(on) { $("#ask").disabled = !on; $("#send").disabled = !on; if (on) $("#ask").focus(); }
 
 /* =============================== the brain =============================== */
-async function brain(q) {
-  if (getUserKey()) return liveBrain(q);                       // user supplied their own key → real reasoning
-  if (S.isSample) { const s = scriptFor(q); if (s) return s; } // offline: curated answers on the sample
-  return offlineNav(q);                                        // offline: honest section navigation, no faking
-}
-
-const STEPS_SCHEMA = {
+/* structured-output schema: one object that is EITHER a clarify question OR an answer */
+const RESPONSE_SCHEMA = {
   type: "object", additionalProperties: false,
   properties: {
+    type: { type: "string", enum: ["clarify", "answer"] },
+    question: { type: "string" },
+    options: { type: "array", items: { type: "string" } },
     steps: {
       type: "array", items: {
         type: "object", additionalProperties: false,
-        properties: {
-          find: { type: "string" }, type: { type: "string", enum: ["circle", "underline", "arrow"] }, say: { type: "string" },
-        },
-        required: ["find", "type", "say"],
+        properties: { find: { type: "string" }, gesture: { type: "string", enum: ["circle", "underline", "arrow"] }, say: { type: "string" } },
+        required: ["find", "gesture", "say"],
       },
     },
     note: { type: "string" },
   },
-  required: ["steps", "note"],
+  required: ["type", "question", "options", "steps", "note"],
 };
 
-/* ---- live: the user's OWN key, called straight from their browser to Anthropic ----
-   The key is read from localStorage (this browser only) and goes ONLY to api.anthropic.com.
-   It is never in the shipped files and never touches any server of yours — so sharing the app
-   cannot leak your key. Anthropic permits browser calls when the dangerous-direct-browser-access
-   header is set (the "danger" is only that you must never ship a SHARED key — which we don't). */
-async function liveBrain(q) {
+// first message carries the whole filing (cached across clarify rounds) + the question
+function userMsgWithFiling(q) {
+  return { role: "user", content: [
+    { type: "text", text: "Full text of the 10-K filing:\n\n" + S.fullText.slice(0, 180000), cache_control: { type: "ephemeral" } },
+    { type: "text", text: "ANALYST QUESTION: " + q },
+  ] };
+}
+
+/* ---- one turn of the conversation: the user's OWN key, called straight from the browser ----
+   Key lives in localStorage (this browser only) and goes ONLY to api.anthropic.com — never in
+   the shipped files, never to any server of yours, so sharing the app can't leak your key. */
+async function liveStep() {
   let r;
   try {
     r = await fetch("https://api.anthropic.com/v1/messages", {
@@ -292,23 +357,24 @@ async function liveBrain(q) {
         "content-type": "application/json",
       },
       body: JSON.stringify({
-        model: CONFIG.MODEL, max_tokens: 1500, system: SYSTEM_PROMPT,
-        messages: [{ role: "user", content: S.fullText.slice(0, 180000) + "\n\nQUESTION: " + q }],
-        output_config: { format: { type: "json_schema", schema: STEPS_SCHEMA } },
+        model: CONFIG.MODEL, max_tokens: 1200, system: SYSTEM_PROMPT,
+        messages: S.convo,
+        output_config: { format: { type: "json_schema", schema: RESPONSE_SCHEMA } },
       }),
     });
-  } catch (e) { return { note: "Couldn't reach Anthropic from the browser (network/CORS). " + (e.message || "") }; }
+  } catch (e) { return { note: "Couldn't reach Anthropic from the browser (network). " + (e.message || "") }; }
   if (!r.ok) {
     const t = await r.text().catch(() => "");
     if (r.status === 401) return { note: "That API key was rejected (401). Tap 🔑 and re-check it." };
-    if (r.status === 429) return { note: "Rate limited (429) — wait a moment and ask again." };
+    if (r.status === 429) return { note: "Rate limited (429) — wait a moment and try again." };
     return { note: `Couldn't reach Claude (${r.status}). ${t.slice(0, 160)}` };
   }
   const data = await r.json();
   const txt = (data.content || []).filter((b) => b.type === "text").map((b) => b.text).join("");
+  S.convo.push({ role: "assistant", content: txt });
   try { return JSON.parse(txt); } catch (e) {
     const m = txt.match(/\{[\s\S]*\}/); if (m) { try { return JSON.parse(m[0]); } catch (_) {} }
-    return { note: "Got a response I couldn't parse — try rephrasing the question." };
+    return { note: "Got a response I couldn't parse — try rephrasing." };
   }
 }
 
@@ -412,23 +478,17 @@ const SUGGESTIONS = [
 ];
 function enableChat() {
   $("#suggest").innerHTML = "";
-  (S.isSample ? SUGGESTIONS : (getUserKey() ? SUGGESTIONS : ["Show the income statement", "Show the balance sheet", "Show the cash flows"])).forEach((s) => {
-    const b = el("button", null, esc(s)); b.onclick = () => { $("#ask").value = s; submit(); }; $("#suggest").appendChild(b);
-  });
+  SUGGESTIONS.forEach((s) => { const b = el("button", null, esc(s)); b.onclick = () => { $("#ask").value = s; submit(); }; $("#suggest").appendChild(b); });
   setComposer(true);
   msgs().innerHTML = "";
-  const live = !!getUserKey();
   addPlain(S.isSample
-    ? (live
-      ? "I've read this 10-K (using your key). Ask me anything — I'll find the answer, draw on the page to show you exactly where it is, and explain why."
-      : "I've read this 10-K. Ask me anything — I'll find the answer, draw on the page, and explain why. (These sample questions work offline; tap 🔑 to add your Claude key and ask anything.)")
-    : (live
-      ? "I've loaded your filing (using your key). Ask anything and I'll point to the answer on the page and explain it."
-      : "I've loaded your filing. To actually read it — find an answer, point to the exact numbers, and explain why — I need the AI: tap 🔑 (top right) to add your own Claude key (it stays in your browser). Without it I can only jump you to standard sections like the income statement or balance sheet."));
+    ? "I've read this 10-K. Ask me anything — even something broad like “the income statement.” I'll ask a quick question or two to pin down exactly what you need, then point to it on the page and explain why."
+    : "I've read your filing. Ask me anything — even something broad. I'll ask a quick 1-2-3 question to nail down what you want, then point to it on the page and explain.");
 }
 function submit() { const v = $("#ask").value.trim(); if (!v) return; $("#ask").value = ""; ask(v); }
 
 function handleFile(file) {
+  if (!getUserKey()) { openKey(); return; }                    // key required first
   if (!file || file.type !== "application/pdf") { alert("Please choose a PDF file."); return; }
   file.arrayBuffer().then((buf) => loadFromData(buf, file.name, false));
 }
@@ -441,37 +501,51 @@ function boot() {
   drop.addEventListener("drop", (e) => handleFile(e.dataTransfer.files[0]));
   $("#loadSample").onclick = (e) => {
     e.stopPropagation();
+    if (!getUserKey()) { openKey(); return; }                  // key required first
     fetch(CONFIG.SAMPLE_PDF).then((r) => r.arrayBuffer()).then((buf) => loadFromData(buf, "Helios Materials, Inc. — Form 10-K (sample)", true))
       .catch(() => alert("Couldn't load the sample PDF."));
   };
   $("#send").onclick = submit;
   $("#ask").addEventListener("keydown", (e) => { if (e.key === "Enter") submit(); });
+  // press 1-9 to pick a clarifying option (unless typing in the box)
+  document.addEventListener("keydown", (e) => {
+    if (!S.activeOptions || document.activeElement === $("#ask")) return;
+    const n = parseInt(e.key, 10);
+    if (n >= 1 && n <= S.activeOptions.length) { e.preventDefault(); pick(n - 1); }
+  });
   $("#muteBtn").onclick = (e) => {
     S.voice = !S.voice; e.currentTarget.classList.toggle("on", S.voice); e.currentTarget.textContent = S.voice ? "🔊" : "🔇";
     if (!S.voice && "speechSynthesis" in window) window.speechSynthesis.cancel();
   };
   $("#newBtn").onclick = () => { if ("speechSynthesis" in window) window.speechSynthesis.cancel(); location.reload(); };
 
-  // bring-your-own-key modal
+  // bring-your-own-key modal (a key is REQUIRED before anything works)
   const km = $("#keyModal");
   const closeKm = () => { km.hidden = true; };
-  $("#keyBtn").onclick = () => { $("#keyInput").value = getUserKey(); $("#keyShow").checked = false; $("#keyInput").type = "password"; km.hidden = false; $("#keyInput").focus(); };
+  $("#keyBtn").onclick = openKey;
+  $("#uploadKeyBtn").onclick = openKey;
   $("#keyCancel").onclick = closeKm;
   km.onclick = (e) => { if (e.target === km) closeKm(); };
   $("#keyShow").onchange = (e) => { $("#keyInput").type = e.target.checked ? "text" : "password"; };
   $("#keySave").onclick = () => {
     const v = $("#keyInput").value.trim();
-    if (v) setUserKey(v); closeKm(); refreshKeyBtn();
-    if (v && S.pdf) addPlain("Key saved — it stays in this browser. Now ask me anything about this filing and I'll reason over the whole thing.");
+    if (v) setUserKey(v); closeKm(); refreshGate();
+    if (v && S.pdf) addPlain("Key saved — it stays in this browser. Ask me anything about this filing.");
   };
-  $("#keyClear").onclick = () => { clearUserKey(); $("#keyInput").value = ""; closeKm(); refreshKeyBtn(); };
-  refreshKeyBtn();
+  $("#keyClear").onclick = () => { clearUserKey(); $("#keyInput").value = ""; closeKm(); refreshGate(); };
+  refreshGate();
 }
-function refreshKeyBtn() {
-  const b = $("#keyBtn"); if (!b) return;
+function openKey() {
+  $("#keyInput").value = getUserKey(); $("#keyShow").checked = false; $("#keyInput").type = "password";
+  $("#keyModal").hidden = false; $("#keyInput").focus();
+}
+function refreshGate() {
   const has = !!getUserKey();
-  b.textContent = has ? "🔑 Key set" : "🔑 Add your key";
-  b.classList.toggle("set", has);
+  const drop = $("#drop"); if (drop) drop.classList.toggle("locked", !has);
+  const kg = $("#keygate"); if (kg) kg.classList.toggle("set", has);
+  const kt = $("#keygateText"); if (kt) kt.textContent = has ? "Your Claude key is set — you're ready" : "Add your Claude key to begin";
+  const ukb = $("#uploadKeyBtn"); if (ukb) ukb.textContent = has ? "🔑 Change key" : "🔑 Add your key";
+  const b = $("#keyBtn"); if (b) { b.textContent = has ? "🔑 Key set" : "🔑 Add your key"; b.classList.toggle("set", has); }
 }
 boot();
 })();
